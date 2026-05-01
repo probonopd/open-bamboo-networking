@@ -96,7 +96,7 @@ Please note:
 ## Supported platforms
 
 - Linux x86_64 (primary target, gcc 13+/15+, libstdc++new C++11 ABI).
-- Linux aarch64 (cross-compile-friendly, see `cmake/toolchains/`).
+- Linux aarch64 (primary target, cross-compile-friendly, see `cmake/toolchains/`).
 
 Windows and macOS are architected for but not yet built and tested: the ABI uses
 `std::string`/`std::map`/`std::function` across the boundary, which means we
@@ -107,7 +107,7 @@ sets `ignore_module_cert = 1`.
 ## Supported Bambu Studio versions
 
 - **Minimum supported**: Bambu Studio **02.05.00.xx**
-- **Maximum supported**: Bambu Studio **02.06.00.xx**
+- **Maximum supported**: Bambu Studio **02.06.01.xx**
 
 ## Developer Mode requirement
 
