@@ -1639,17 +1639,51 @@ Per-command request shape (the `req` object — line numbers for the assemblers 
 
 #### 7.6.1. Storage-prefix probing
 
-Studio's CTRL requests address files by **logical storage label** (`storage` field on `LIST_INFO`, `path` field on the others). The labels Studio knows about are `sdcard` and `usb`. The actual filesystem layout the plugin sees over FTPS depends on the printer:
+Studio's CTRL requests address files by **logical storage label** (`storage` field on `LIST_INFO`, `path` field on the others). The labels Studio knows about are `sdcard` and `usb`. The actual filesystem layout the plugin sees over FTPS depends on the printer/firmware:
 
-- P1 / X1 with a microSD card: `LIST /sdcard` works, root listing returns just `/sdcard`.
-- New A-series and P2S with a USB stick: `LIST /usb` works.
-- P2S with the storage at the FTPS root (no `/sdcard` or `/usb` indirection): only `LIST /` works.
+- `LIST /sdcard`.
+- `LIST /usb`.
+- `LIST /` that directly targets external disk drive
 
 The plugin does the mapping. Our implementation probes once per session (`stubs/BambuSource.cpp::ensure_ftp`) and stores three values on the tunnel: `storage_label`, `ftp_prefix`, and `root_is_storage`. Every request from Studio is then rewritten as `<ftp_prefix>/<path-from-request>`. See § "FTPS storage probing" in `README.md` for the full table of observed firmwares.
 
 #### 7.6.2. The tunnel keeps Studio and FTPS sequenced
 
 There are no concurrent CTRL requests on the same tunnel: `PrinterFileSystem::RunRequests` serialises everything on the worker thread, holding `m_mutex` between `Bambu_SendMessage` and the matching `Bambu_ReadSample`. This means the plugin can serve requests strictly sequentially without worrying about interleaved FTPS commands on its side.
+
+#### 7.6.3. FTPS dialect quirks
+
+Bambu firmware ships a stripped-down vsftpd / busybox-ftpd hybrid (the exact image varies across O1S / X1 / P1 / P2S / A-series) that deviates from RFC 959 / 4217 in several ways. None of these quirks are documented anywhere in the stock plugin or Studio source, so a fresh implementation needs to know all of them up front. The list below is the union of what `src/ftps.cpp` and `tools/bambu_ftp_proxy.py` (Bambu FTPS ⇆ plaintext FTP bridge for arbitrary clients) had to handle empirically.
+
+- **Implicit TLS, TCP/990.** The TLS handshake starts immediately after the TCP `connect()`; there is no `AUTH TLS` upgrade dance. A plaintext FTP client that opens 990 and waits for a `220` banner gets nothing — the server is already in TLS mode. See `obn::ftps::Client::connect` in `src/ftps.cpp:265-326`.
+- **Self-signed cert with no usable SAN.** The certificate Bambu's FTPS daemon presents has no SAN that matches the printer's LAN IP, so OpenSSL hostname verification always fails. Run with `SSL_VERIFY_NONE` (this is the same compromise we already make for MQTT against the same printer). Pinning against the bundled `printer.cer` chain works on some firmwares but not all; the C++ client falls back to no-verify when load fails (`src/ftps.cpp:283-293`).
+- **Login is `USER bblp` + `PASS <printer-access-code>`.** The 8-character code shown on the printer screen is the FTPS password. There is no anonymous mode, and no other usernames are accepted. The `bblp` literal is hard-coded in `obn::ftps::ConnectConfig` (`include/obn/ftps.hpp:31`).
+- **Mandatory post-login sequence.** After `230` the client *must* issue `TYPE I` → `PBSZ 0` → `PROT P` in that order before any data-channel command. Skipping `PROT P` (or sending it before `PBSZ`) makes the next `PASV` reply 425/431 depending on firmware. See `src/ftps.cpp:319-324`.
+- **PASV only — `PORT` is not implemented.** The daemon either ignores `PORT` outright or replies `500 Unknown command`. Active mode is not negotiable.
+- **PASV replies with a bogus IP.** The first four digits of the `(h1,h2,h3,h4,p1,p2)` tuple cannot be trusted: most firmwares advertise `0.0.0.0`, some leak a private printer-side address (`192.168.x.x` from the firmware's internal namespace) that is not reachable from the LAN. **Always discard those four octets and reconnect the data socket to the same host that the control connection is on.** Same trick as the C++ `open_data_tcp` (`src/ftps.cpp:334-362`) and the Python proxy's `PrinterFtps.open_data_socket`.
+- **Delayed TLS handshake on the data channel.** This is the single biggest gotcha. The wire order for a STOR/RETR/LIST is:
+  1. send `PASV`, parse the reply, TCP-connect to the printer's data port (still plaintext);
+  2. send the data command (`STOR foo` / `LIST` / …) on the control;
+  3. wait for the `150` reply;
+  4. **only now** start the TLS handshake on the data socket;
+  5. transfer payload bytes;
+  6. close (or `SSL_shutdown`) the data socket;
+  7. read the `226`/`250` final reply on control.
+
+  If the client tries to TLS-handshake right after the TCP connect (the order most generic FTPS libraries follow), the daemon never starts its half of the handshake and the connection hangs until the data timeout. The C++ wrapper sequences this explicitly (`src/ftps.cpp::stor`, `src/ftps.cpp::retr`, `src/ftps.cpp::list_entries`); the Python proxy does the same in `ProxySession._do_data_transfer`.
+- **Data-channel TLS session reuse.** Bambu's current vsftpd build accepts data sockets without session reuse, but several adjacent FTPS forks (pureftpd hardened, newer vsftpd with `require_ssl_reuse=YES`) refuse otherwise. Safe to always opt in: pull the control session via `SSL_get1_session()` and bind it to the data SSL with `SSL_set_session()` before `SSL_connect()` (`src/ftps.cpp:366-388`). Python equivalent: assign `data_ssock.session = ctrl_ssock.session` before `do_handshake()`.
+- **`MLSD` is not implemented.** `FEAT` does *not* list `MLSD`, and an explicit `MLSD` call returns `500 Unknown command` on every firmware we have observed (O1S / X1 / P1 / P2S / A1). Use `LIST` exclusively. The output is plain `ls -l` with two date variants and timestamps in the printer's *local* time without a timezone hint — we parse it as UTC and accept the per-firmware skew (`src/ftps_parse.hpp::parse_ls_line`):
+  ```text
+  -rwxr-xr-x  1 0 0     12345 Oct 21 12:34 name        # recent (HH:MM, year implicit)
+  -rwxr-xr-x  1 0 0  98765432 Oct 21  2020 name        # old / future (year explicit, no HH:MM)
+  ```
+- **`NLST` is unreliable.** Some firmwares return clean filenames; others return the full `ls -l` block, and a few reply `502`. Treat `NLST` as a hint only and always be prepared to fall back to `LIST` + parse-and-extract-name — that is what `tools/bambu_ftp_proxy.py::parse_ls_name` does for clients that issue `NLST`.
+- **No `MKD` / `RMD` / `APPE` / `REST` / `RNFR` / `RNTO` / `MDTM`.** Either the command is not wired up (response: `502 Command not implemented`) or it is gated off (response: `550`). In particular: you cannot create a directory over FTPS, and you cannot resume an interrupted `STOR` — Studio's "upload retry" flow re-uploads from byte 0. `SIZE` *is* implemented (`213 <bytes>`), `DELE` is implemented, `CWD` works, `PWD` is hit-and-miss across firmwares.
+- **Idle timeout ≈ 5 minutes.** The control connection is torn down silently (no `421 Timeout` first) once it has been idle for roughly 5 minutes. The plugin handles this with the reconnect-on-stale retry in `stubs/BambuSource.cpp::reconnect_ftp`; the standalone Python proxy lets the session die and waits for the next plaintext-side connect to re-login.
+- **Strictly serial commands.** Pipelining or concurrent commands on the same control connection is not safe — the daemon can desynchronise its reply queue. Always wait for the previous reply (or, for data commands, the closing `226`) before sending the next command. `src/ftps.cpp` and the Python proxy both keep the control loop strictly serial.
+- **Only the bare command set is implemented.** From RFC 959 Bambu firmware reliably implements: `USER`, `PASS`, `TYPE` (`I` only — `A` is accepted but `STOR` of an ASCII file still ships the bytes verbatim), `PBSZ`, `PROT`, `PASV`, `LIST`, `RETR`, `STOR`, `DELE`, `SIZE`, `CWD`, `CDUP`, `PWD` (sometimes), `NOOP`, `QUIT`. Everything else is best-effort or missing.
+
+A standalone reference implementation that exercises every quirk above lives in `tools/bambu_ftp_proxy.py` — it is a single-file plaintext-FTP-server-to-Bambu-FTPS-client bridge that lets any FTP client (lftp, curl, GNOME Files, Nautilus over GVfs, …) talk to the printer without speaking FTPS at all. Useful for debugging the wire layer in isolation from the rest of the plugin.
 
 ### 7.7. Lifetime, error propagation and reconnect
 
