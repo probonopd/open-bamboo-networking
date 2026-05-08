@@ -112,22 +112,30 @@ list of accepted keys (and their types) is the source of truth:
 typed setters. Missing keys keep `BBL::PrintParams{}` defaults; unknown
 or wrong-typed keys log a `params_warning` event and are ignored.
 
-Minimal experiment that toggles `task_timelapse_use_internal`:
+A ready-to-edit reference covering every field this loader knows
+about — including `ams_mapping*` JSON-array-as-string conventions,
+default values from a real Studio session, and the `task_*` toggles
+that map straight into the MQTT `project_file` payload — lives at
+[`tools/plugin_runner/example.params.json`](example.params.json). Copy
+it, point `filename` at your local 3mf, drop fields you don't want to
+override, and pass the result via `--params-json`.
+
+Minimal experiment that toggles just `task_timelapse_use_internal`:
 
 ```json
 {
-    "task_name": "obn-runner-test",
-    "task_record_timelapse": true,
+    "filename":                    "/path/to/your-job.gcode.3mf",
+    "task_name":                   "obn-runner-test",
+    "task_record_timelapse":       true,
     "task_timelapse_use_internal": true,
-    "task_bed_type": "auto",
-    "ftp_folder": "/sdcard"
+    "task_bed_type":               "auto"
 }
 ```
 
-The wrapper auto-fills `dev_id`, `dev_ip`, `username` (`bblp`),
-`password` (your `--access-code`) and `use_ssl_for_mqtt` from CLI
-flags, so you don't have to encode the printer identity in every JSON
-file.
+`dev_id`, `dev_ip`, `username` (`bblp`), `password` (your
+`--access-code`) and `use_ssl_for_mqtt` only fall back to their CLI
+values when the JSON leaves them blank — encode them only if you want
+to override the wrapper.
 
 ## 5. Worked examples
 
