@@ -311,6 +311,26 @@ For `bambu:///local/*` URLs the fast path serves the whole `ft_*` bus over FTPS 
 | `ft_job_try_get_msg` | ❌ | Always returns `FT_EIO`. Progress messages are pushed through `msg_cb` rather than polled, matching how Studio actually consumes them. |
 | `ft_job_get_msg` | ❌ | Always returns `FT_EIO`, same reason as above. |
 
+### 6.14.1. FTPS fastpath vs stock port-6000 framer
+
+Studio uses the `ft_*` ABI for the **Send to Printer** dialog (upload without printing), the eMMC pre-flight check in the regular Print job, and media-ability queries. The proprietary `libbambu_networking.so` serves these over a **port-6000 TLS tunnel** with a JSON command framer we have **not** reimplemented. See [NETWORK_PLUGIN.md § 6.14](NETWORK_PLUGIN.md#614-file-transfer-abi-ft_) for the ABI contract.
+
+Two build modes, toggled with `-DOBN_FT_FTPS_FASTPATH=ON|OFF` (default **ON**):
+
+**`OBN_FT_FTPS_FASTPATH=ON` (default).**  
+For `bambu:///local/…` URLs the plugin implements the ABI over the **same FTPS connection** the print job uses:
+
+- `cmd_type=7` (media ability) is answered by probing `CWD /sdcard` and `CWD /usb` on the printer. X1/P1P/A1 and first-gen A1 mini have the SD-card mount; P2S has a USB port instead. Printers with both get both back. If *neither* path answers but the FTPS login succeeded (the P2S case), the fastpath treats the FTPS root as the storage mount and reports `["sdcard"]` so Studio's picker lights up. `emmc` is never reported — on Bambu firmware that storage is for system files, not user uploads.
+- `cmd_type=5` (upload) runs `STOR /<dest_storage>/<dest_name>` with byte-level progress forwarded to Studio as `{"progress":N}` via `msg_cb` (skipping 99, which Studio reserves as a timeout tripwire). When the tunnel is in root-is-storage mode the `STOR` target is just `/<dest_name>`.
+- TUTK/Agora URLs still return `FT_EIO` — we don't speak the cloud p2p transport.
+
+Net effect: the Send to Printer dialog walks through the same UI states as with the stock plugin (Reading storage → picker → sending with real % progress), the eMMC pre-flight in the regular Print job gets a clean `["sdcard"]` / `["usb"]` answer and Studio stops logging a fallback every time.
+
+**`OBN_FT_FTPS_FASTPATH=OFF`.**  
+Every `ft_*` entry point is a polite-failure stub that fires its callback synchronously with `FT_EIO` and a "fall back to FTP" message. Studio's internal fallback kicks in and the 3mf is uploaded through `bambu_network_start_send_gcode_to_sdcard`, which also uses FTPS. Same file lands in the same place — the UI skips the media-ability step and per-percent progress comes from the fallback instead.
+
+**Scope:** the fastpath is a deliberate shortcut, not a clean reimplementation of the proprietary port-6000 protocol. MakerWorld-style project metadata, eMMC-as-primary-storage, or the "Send to multiple machines" batch UI remain limited to what the fallback path supports.
+
 ---
 
 ## `libBambuSource.so` (second library)
@@ -347,6 +367,28 @@ The build is intentionally minimal-dependency: only OpenSSL and zlib, **no `liba
 | MJPEG over TLS, port 6000 | A1 / A1 mini / P1 / P1P | ✅ (not tested) | TLS + 80-byte auth + 16-byte framed JPEG samples. Linux: passes JPEG bytes through to `gstbambusrc`'s `jpegdec`. Windows: same JPEG payload pushed through our DShow source filter as `MEDIASUBTYPE_MJPG`. No A-series hardware available for on-device verification. |
 | RTSPS → H.264 byte-stream, port 322 | X1 / X1C / X1E / P1S / P2S / H-series / X2D | ✅ (tested on P2S, both Studio and Orca) | Custom in-process RTSP/RTSPS client; raw H.264 Annex-B byte stream out (same wire format the stock plugin produces). Linux: slicer-side `gstbambusrc` decodes with `h264parse + avdec_h264 / openh264dec`. Windows Studio: decoded by the in-tree FFmpeg `AVVideoDecoder` (`wxMediaCtrl3`). Windows Orca: pushed as `MEDIASUBTYPE_H264` through our DShow source filter into wmp's H.264 decoder. |
 | Cloud camera (TUTK / Agora p2p) | any printer over WAN | 🔒 | Proprietary SDK; out of scope. Stays on the LAN/Developer-Mode path. |
+
+### PrinterFileSystem (MediaFilePanel)
+
+Studio's **MediaFilePanel** opens a port-6000 tunnel through `libBambuSource.so` and switches it to a CTRL channel via `Bambu_StartStreamEx(CTRL_TYPE)`. It then sends JSON request/response messages (`LIST_INFO`, `SUB_FILE`, `FILE_DOWNLOAD`, `FILE_DEL`, `REQUEST_MEDIA_ABILITY`, `TASK_CANCEL`) that Studio renders as **Device → Files** (timelapses, camera recordings, printed models with thumbnails).
+
+Our `libBambuSource.so` does **not** speak the proprietary CTRL **wire** protocol to the printer on that socket; instead a worker thread per tunnel services those JSON requests over **FTPS :990** (the same service used for LAN print uploads). That gives the file browser on every printer reachable over TLS on 990, regardless of whether the firmware implements native CTRL on 6000.
+
+Supported operations (CTRL → FTPS mapping):
+
+- `REQUEST_MEDIA_ABILITY` — probe `/sdcard` and `/usb`; if neither exists, treat the FTPS root as the storage mount (P2S-style USB-only) and report it as `"sdcard"` to Studio.
+- `LIST_INFO` — `LIST` (firmware does not implement `MLSD`) on `<prefix>/timelapse/` (timelapse tab), `<prefix>/ipcam/` (manual video tab), `<prefix>/` (model tab). Files are filtered by extension (`.mp4`, `.3mf`, `.gcode.3mf`).
+- `SUB_FILE` thumbnails — timelapses: fetch sidecar `.jpg`; `.3mf`: download the archive, parse the central directory, `inflate` `Metadata/plate_1.png` (or `plate_no_light_1.png`) with zlib raw deflate — no external ZIP dependency.
+- `FILE_DOWNLOAD` — streaming `RETR` with 256 KB chunks; each chunk is a separate `CONTINUE` reply; final reply `SUCCESS`.
+- `FILE_DEL` — `DELE` per path (modern `{"paths":[…]}` only; legacy `{"delete":[…]}` not used by current Studio).
+- `TASK_CANCEL` — marks a sequence number; the worker aborts the relevant multi-chunk response at the next checkpoint.
+
+`FILE_UPLOAD` is **not** implemented here: Send to Printer uses the separate `ft_*` ABI in `libbambu_networking.so` (§6.14).
+
+**`ipcam.file` in MQTT `push_status`:**
+
+- Firmware that **does** send `ipcam.file` (typical X1 / P1S class): the networking plugin passes it through untouched — we avoid advertising a capability string we don't match exactly against stock BambuSource behaviour.
+- Firmware that **does not** advertise `ipcam.file` (P2S, A-series, some revisions): the plugin injects `"file":{"local":"local","remote":"none","model_download":"enabled"}` into every LAN `ipcam` block so Studio opens the port-6000 tunnel; without it, MediaFilePanel would short-circuit with "Browsing file in storage is not supported in current firmware."
 
 ### File browser (CTRL bridge)
 
@@ -392,6 +434,19 @@ Required for camera live view in **OrcaSlicer on Windows** (which still routes t
 | RTSPS → H.264 Annex-B | ✅ (tested on P2S) | Reuses the same `obn::rtsp::Passthrough` worker the Linux/macOS build uses. Annex-B access units (with SPS/PPS re-prepended on every IDR) are pushed through the downstream `IMemInputPin::Receive` until `Stop()` decommits the allocator. |
 | MJPEG / port 6000 | ✅ (not tested on hardware) | TLS dial + 80-byte auth + 16-byte framed JPEG payload, pushed as `MEDIASUBTYPE_MJPG` samples. |
 
+### Windows-specific footguns
+
+If you touch the DirectShow source filter or the `Bambu_*` path on Windows, three sharp edges are already handled in-tree — worth knowing so the next person does not re-debug from a `0xC0000409` minidump:
+
+1. **`setvbuf(fp, NULL, _IOLBF, 0)` is undefined on the MSVC CRT.**  
+   MSVC `_setvbuf_internal` enforces: if `buffer == NULL`, the only accepted mode is `_IONBF` (size 0), via `_invalid_parameter` → `__fastfail(FAST_FAIL_INVALID_ARG)` → `STATUS_STACK_BUFFER_OVERRUN`. The same call is accepted by glibc/musl. Cross-platform logger code that wants line-buffering-like behaviour on Windows must either supply a real buffer or use `_IONBF` and flush on each `fprintf`. See [stubs/source_log.cpp](stubs/source_log.cpp) `mirror_log_fp()` and [src/log.cpp](src/log.cpp) `open_file_locked()`.
+
+2. **`wxURI` collapses `bambu:///rtsps___…` to `bambu://rtsps___…`.**  
+   Orca/Studio `MediaPlayCtrl` builds the triple-slash form (scheme, empty authority, path), but wxURI’s canonicaliser may treat part of the path like userinfo/host, reparse, and emit a single `//` before `IFileSourceFilter::Load`. A parser keyed strictly on `bambu:///rtsps___` rejects every Orca camera URL with `E_INVALIDARG`. Accept any number of `/` after `bambu:`.
+
+3. **DirectShow sources must push samples while the graph is `Paused`, not only `Running`.**  
+   wmp/wxMediaCtrl keeps the graph in `State_Paused` until the renderer gets the first sample (which triggers `State_Running`). A worker that gates `IMemInputPin::Receive` on `State_Running` deadlocks: renderer waits for the first sample, source waits for `Running` → black frame, endless “playing”, RTSP disconnect on back-pressure. Standard pattern: commit the allocator in `Pause()` and start streaming immediately.
+
 ### macOS
 
 | Feature | Status | Notes |
@@ -408,6 +463,9 @@ Required for camera live view in **OrcaSlicer on Windows** (which still routes t
 | Common cloud HTTPS transport (hosts, bearer, response envelopes) | [NETWORK_PLUGIN.md § 6.10.1](NETWORK_PLUGIN.md#6101-common-cloud-transport) |
 | Filament Manager REST shapes (MITM) | [NETWORK_PLUGIN.md § 6.15](NETWORK_PLUGIN.md#615-filament-manager-cloud-spool-catalogue) |
 | `libBambuSource` C ABI, camera URL formats, CTRL bridge | [NETWORK_PLUGIN.md § 7](NETWORK_PLUGIN.md#7-the-libbambusource-library) |
+| `ft_*` FTPS fastpath vs `OBN_FT_FTPS_FASTPATH` | [STATUS.md § 6.14.1](STATUS.md#6141-ftps-fastpath-vs-stock-port-6000-framer) |
+| PrinterFileSystem / Device → Files (CTRL → FTPS, `ipcam.file`) | [STATUS.md — PrinterFileSystem (MediaFilePanel)](STATUS.md#printerfilesystem-mediafilepanel) |
 | FTPS dialect quirks (used by `libBambuSource` CTRL bridge and by `ft_*`) | [NETWORK_PLUGIN.md § 7.6.3](NETWORK_PLUGIN.md#763-ftps-dialect-quirks) |
+| Windows: MSVC `setvbuf`, wxURI `bambu://` slashes, DirectShow `Paused` vs `Running` | [STATUS.md — Windows-specific footguns](STATUS.md#windows-specific-footguns) |
 | Feature-level status tables (per-model) | [README.md](README.md) |
 | Workaround rationale | [README.md § Workaround reference](README.md#workaround-reference) |
