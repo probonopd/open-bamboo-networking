@@ -1,4 +1,5 @@
-# Build and test open-bambu-networking on Linux x86_64 and aarch64.
+# Build and test open-bambu-networking on Linux x64 / aarch64 and on
+# Windows x64 (MSVC + vcpkg manifest).
 #
 # Version strategy: the plugin must report a string whose first 8 characters
 # match Bambu Studio's SLIC3R_VERSION. We therefore look up the most recent
@@ -7,11 +8,18 @@
 # uses for local auto-detection). This means CI follows upstream releases
 # automatically -- no manual version bumps in this repo.
 #
-# Artifacts (one set per architecture):
+# Linux artifacts (one set per ABI version / architecture):
 #   * libbambu_networking.so
 #   * libBambuSource.so
 #   * liblive555.so
 #   * network_plugins.json
+#
+# Windows artifacts (one set per ABI version):
+#   * bambu_networking.dll
+#   * BambuSource.dll
+#   * live555.dll (stub)
+#   * network_plugins.json
+#   * ota/plugins/
 
 name: Build
 
@@ -51,55 +59,32 @@ jobs:
         run: tools/check_abi_compat.sh
 
   build:
-    name: ${{ matrix.arch }}
-    runs-on: ${{ matrix.runner }}
+    name: v${{ matrix.abi }}.xx-linux-${{ matrix.arch }}
+    runs-on: ${{ matrix.arch == 'x64' && 'ubuntu-24.04' || 'ubuntu-24.04-arm' }}
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - arch: x86_64
-            runner: ubuntu-24.04
-          - arch: aarch64
-            runner: ubuntu-24.04-arm
+        abi:
+          - 02.05.00
+          - 02.05.01
+          - 02.05.02
+          - 02.05.03
+          - 02.06.00
+          - 02.06.01
+        arch:
+          - x64
+          - aarch64
 
     steps:
       - name: Checkout
         uses: actions/checkout@v6
 
       - name: Install build dependencies
-        # libBambuSource carries its own RTSP/RTSPS client and an
-        # H.264 Annex-B passthrough; gstbambusrc on the slicer side
-        # decodes via h264parse + avdec_h264 / openh264dec. So we no
-        # longer need any libav* package at build time.
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             build-essential cmake pkg-config ca-certificates git \
             libcjson-dev uthash-dev libcurl4-openssl-dev libssl-dev zlib1g-dev
-
-      - name: Resolve plugin version from upstream Bambu Studio
-        id: ver
-        run: |
-          set -eu
-          tag=$(git ls-remote --tags --refs \
-                   https://github.com/bambulab/BambuStudio.git 'refs/tags/v*' \
-                 | awk -F/ '{print $NF}' \
-                 | sort -V \
-                 | tail -n1)
-          if [ -z "$tag" ]; then
-              echo "::error::could not list tags at bambulab/BambuStudio" >&2
-              exit 1
-          fi
-          upstream=${tag#v}
-          plugin=$(printf '%s' "$upstream" | sed -E 's/\.[0-9]+$/.99/')
-          echo "upstream tag    : $tag"
-          echo "upstream version: $upstream"
-          echo "plugin version  : $plugin"
-          {
-              echo "upstream_tag=$tag"
-              echo "upstream_version=$upstream"
-              echo "plugin_version=$plugin"
-          } >> "$GITHUB_OUTPUT"
 
       - name: Configure
         run: |
@@ -107,7 +92,7 @@ jobs:
             --build-type=Release \
             --vendor-mosquitto \
             --enable-tests \
-            --with-version='${{ steps.ver.outputs.plugin_version }}' \
+            --with-version='${{ matrix.abi }}.99' \
             --no-conf-patch
 
       - name: Build
@@ -139,6 +124,97 @@ jobs:
       - name: Upload artifacts
         uses: actions/upload-artifact@v6
         with:
-          name: open-bambu-networking-linux-${{ matrix.arch }}-${{ steps.ver.outputs.plugin_version }}
+          name: obn-linux-v${{ matrix.abi }}.xx-${{ matrix.arch }}
+          path: dist/
+          if-no-files-found: error
+
+  build-windows:
+    name: v${{ matrix.abi }}.xx-windows-x64
+    runs-on: windows-2022
+    strategy:
+      fail-fast: false
+      matrix:
+        abi:
+          - 02.05.00
+          - 02.05.01
+          - 02.05.02
+          - 02.05.03
+          - 02.06.00
+          - 02.06.01
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      # Shallow clone at master does not necessarily contain the commit in
+      # vcpkg.json "builtin-baseline" — manifest resolution needs that tree.
+      - name: Bootstrap vcpkg (builtin-baseline from vcpkg.json)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $root = Join-Path $env:GITHUB_WORKSPACE 'vcpkg'
+          $baseline = '7147ac1294ef9647e8679e1183ac440a5d0a63b7'
+          if (Test-Path $root) { Remove-Item -Recurse -Force $root }
+          New-Item -ItemType Directory -Path $root | Out-Null
+          git init $root
+          git -C $root remote add origin https://github.com/microsoft/vcpkg.git
+          git -C $root fetch --depth 1 origin $baseline
+          git -C $root checkout --detach FETCH_HEAD
+          & "$root/bootstrap-vcpkg.bat" -disableMetrics
+
+      - name: Configure
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $staging = Join-Path $env:GITHUB_WORKSPACE "install"
+          New-Item -ItemType Directory -Force -Path $staging | Out-Null
+          .\configure.ps1 `
+            -ClientType bambu_studio `
+            -WithVersion '${{ matrix.abi }}.99' `
+            -Prefix $staging `
+            -PatchConf:$false `
+            -RegisterDShowFilter:$false `
+            -EnableTests:$true `
+            -VcpkgRoot (Join-Path $env:GITHUB_WORKSPACE 'vcpkg') `
+            -Generator 'Visual Studio 17 2022'
+
+      - name: Build
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          cmake --build build --config Release --parallel
+
+      - name: Test (probe_plugin)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Push-Location build
+          ctest -C Release --output-on-failure
+          Pop-Location
+
+      - name: Install
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          cmake --install build --config Release
+
+      - name: Stage artifacts
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $src = Join-Path $env:GITHUB_WORKSPACE "install"
+          $dist = Join-Path $env:GITHUB_WORKSPACE 'dist'
+          New-Item -ItemType Directory -Force -Path $dist | Out-Null
+          Copy-Item -Path (Join-Path $src 'plugins\*') -Destination $dist -Force
+          $ota = Join-Path $src 'ota'
+          if (Test-Path $ota) {
+            Copy-Item -Path $ota -Destination (Join-Path $dist 'ota') -Recurse -Force
+          }
+          Get-ChildItem -Recurse $dist | Format-Table FullName,Length -AutoSize
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v6
+        with:
+          name: obn-v${{ matrix.abi }}.xx-windows-x64
           path: dist/
           if-no-files-found: error
