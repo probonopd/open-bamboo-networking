@@ -82,9 +82,20 @@ public:
     Client(const Client&)            = delete;
     Client& operator=(const Client&) = delete;
 
-    // Establishes the TLS control connection, authenticates, switches to
-    // binary mode and enables PROT P on data transfers. Returns an empty
-    // string on success or a human-readable error description.
+    // Establishes the TCP connection and, if cfg.use_tls is true, performs
+    // the TLS handshake. Does NOT authenticate. Returns empty on success.
+    // Separating transport from login lets connect_with_fallback() fall back
+    // only on transport errors, not on credential failures.
+    std::string connect_transport(const ConnectConfig& cfg);
+
+    // Runs the FTP login sequence on an already-established transport
+    // (USER/PASS, TYPE I, and PBSZ 0 + PROT P when use_tls is set).
+    // Must be called after a successful connect_transport(). Returns empty
+    // on success.
+    std::string login(const ConnectConfig& cfg);
+
+    // Convenience: connect_transport() followed by login(). Returns empty on
+    // success or a human-readable error description.
     std::string connect(const ConnectConfig& cfg);
 
     // Uploads the file at `local_path` to `remote_path` on the printer's

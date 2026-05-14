@@ -190,8 +190,12 @@ bool plain_write_all(socket_t fd, const void* buf, std::size_t len, int timeout_
     std::size_t off = 0;
     while (off < len) {
         if (wait_fd(fd, POLLOUT, timeout_ms) <= 0) return false;
-        int r = ::send(static_cast<int>(fd), p + off,
+#if defined(_WIN32)
+        int r = ::send(static_cast<SOCKET>(fd), p + off,
                        static_cast<int>(len - off), 0);
+#else
+        int r = ::send(fd, p + off, static_cast<int>(len - off), 0);
+#endif
         if (r <= 0) return false;
         off += static_cast<std::size_t>(r);
     }
@@ -202,9 +206,12 @@ bool plain_write_all(socket_t fd, const void* buf, std::size_t len, int timeout_
 int plain_read_some(socket_t fd, void* buf, std::size_t max_len, int timeout_ms)
 {
     if (wait_fd(fd, POLLIN, timeout_ms) <= 0) return -1;
-    int r = ::recv(static_cast<int>(fd),
-                   static_cast<char*>(buf),
+#if defined(_WIN32)
+    int r = ::recv(static_cast<SOCKET>(fd), static_cast<char*>(buf),
                    static_cast<int>(max_len), 0);
+#else
+    int r = ::recv(fd, static_cast<char*>(buf), static_cast<int>(max_len), 0);
+#endif
     return r < 0 ? -1 : r;
 }
 
@@ -237,17 +244,23 @@ struct Client::Impl {
     }
 
     // Unified control-channel read/write that dispatches to TLS or plain.
+    // Returns failure gracefully when TLS was requested but SSL* was never
+    // created (e.g. connect() bailed out between TCP connect and SSL_new).
     int ctrl_read(void* buf, std::size_t max_len)
     {
-        if (use_tls)
+        if (use_tls) {
+            if (!ctrl_ssl) return -1;
             return ssl_read_some(ctrl_ssl, ctrl_fd, buf, max_len, control_timeout_ms);
+        }
         return plain_read_some(ctrl_fd, buf, max_len, control_timeout_ms);
     }
 
     bool ctrl_write(const void* buf, std::size_t len)
     {
-        if (use_tls)
+        if (use_tls) {
+            if (!ctrl_ssl) return false;
             return ssl_write_all(ctrl_ssl, ctrl_fd, buf, len, control_timeout_ms);
+        }
         return plain_write_all(ctrl_fd, buf, len, control_timeout_ms);
     }
 
@@ -329,7 +342,7 @@ struct Client::Impl {
 Client::Client() : p_(std::make_unique<Impl>()) { init_openssl_once(); }
 Client::~Client() { quit(); }
 
-std::string Client::connect(const ConnectConfig& cfg)
+std::string Client::connect_transport(const ConnectConfig& cfg)
 {
     p_->control_timeout_ms = cfg.control_timeout_s * 1000;
     p_->data_timeout_ms    = cfg.data_timeout_s * 1000;
@@ -381,8 +394,12 @@ std::string Client::connect(const ConnectConfig& cfg)
     int code = p_->read_reply(&banner);
     if (code != 220) return "no 220 banner (got " + std::to_string(code) + "): " + banner;
     OBN_DEBUG("ftps: banner <%s>", banner.c_str());
+    return {};
+}
 
-    code = p_->send_cmd("USER " + cfg.username);
+std::string Client::login(const ConnectConfig& cfg)
+{
+    int code = p_->send_cmd("USER " + cfg.username);
     if (code != 331 && code != 230) return "USER rejected: code=" + std::to_string(code);
     if (code == 331) {
         code = p_->send_cmd("PASS " + cfg.password, nullptr, /*redact=*/true);
@@ -390,7 +407,7 @@ std::string Client::connect(const ConnectConfig& cfg)
     }
     code = p_->send_cmd("TYPE I");
     if (code != 200) return "TYPE I rejected: code=" + std::to_string(code);
-    if (cfg.use_tls) {
+    if (p_->use_tls) {
         // PBSZ and PROT P are TLS-only commands; plain FTP daemons reject them.
         code = p_->send_cmd("PBSZ 0");
         if (code != 200) return "PBSZ rejected: code=" + std::to_string(code);
@@ -398,8 +415,14 @@ std::string Client::connect(const ConnectConfig& cfg)
         if (code != 200) return "PROT P rejected: code=" + std::to_string(code);
     }
     OBN_INFO("ftps: logged in to %s:%d as %s (tls=%d)",
-             cfg.host.c_str(), cfg.port, cfg.username.c_str(), cfg.use_tls ? 1 : 0);
+             cfg.host.c_str(), cfg.port, cfg.username.c_str(), p_->use_tls ? 1 : 0);
     return {};
+}
+
+std::string Client::connect(const ConnectConfig& cfg)
+{
+    if (std::string err = connect_transport(cfg); !err.empty()) return err;
+    return login(cfg);
 }
 
 // Opens a PASV data connection as a plain TCP socket. vsftpd (which
@@ -752,17 +775,23 @@ std::string connect_with_fallback(Client& client, ConnectConfig cfg)
         return client.connect(cfg);
     }
 
-    // Try TLS first.
-    std::string err = client.connect(cfg);
-    if (err.empty()) return {};
+    // Try TLS transport first. On any transport error (TCP / TLS handshake /
+    // missing banner) fall back to plain. Auth errors (wrong credentials etc.)
+    // are not retried on plain because the same credentials will fail there
+    // too, and we avoid sending them in cleartext unnecessarily.
+    std::string transport_err = client.connect_transport(cfg);
+    if (transport_err.empty()) {
+        // Transport is up; run login. No fallback for login failures.
+        return client.login(cfg);
+    }
 
-    // Any failure -> retry plain on port 21.
     OBN_WARN("ftps: TLS connect to %s:%d failed (%s), retrying plain on port 21",
-             cfg.host.c_str(), cfg.port, err.c_str());
+             cfg.host.c_str(), cfg.port, transport_err.c_str());
     client.quit();
     cfg.use_tls = false;
     cfg.port    = 21;
-    return client.connect(cfg);
+    if (std::string err = client.connect_transport(cfg); !err.empty()) return err;
+    return client.login(cfg);
 }
 
 } // namespace obn::ftps

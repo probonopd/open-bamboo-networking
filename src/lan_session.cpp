@@ -146,8 +146,10 @@ int LanSession::start(ConnectedCb on_connected, MessageCb on_message)
         OBN_ERROR("mqtt connect to %s:%d failed rc=%d (%s)",
                   cfg.host.c_str(), cfg.port, rc, mqtt::Client::err_str(rc));
 
-        if (use_ssl_) {
+        if (use_ssl_ && rc != MOSQ_ERR_INVAL) {
             // Any TLS connect failure -> retry plain on port 1883.
+            // MOSQ_ERR_INVAL means invalid parameters (a code bug), not a
+            // network issue, so a plain retry would not help.
             // The mosquitto instance has TLS baked in; must create a new one.
             OBN_WARN("LanSession: retrying plain (no TLS) on port 1883");
             client_.reset();
