@@ -111,20 +111,26 @@ void propagate_error_code(const obn::json::Value& root,
     }
 }
 
-// Build the top-level POST/PATCH body. Fields that belong in the
-// envelope ("name", "type", "version", "base_id", "filament_id") are
-// pulled from values_map; everything else goes into the `setting`
-// sub-object. Matches the MITM-observed shape of the stock plugin.
+// Build the top-level POST/PATCH body. Envelope fields "version",
+// "type", "base_id" are lifted out of `values_map`; everything else
+// (including **`filament_id`**) stays inside the `setting` object.
+//
+// Important: stock `POST /setting` for a *filament* preset places
+// `filament_id` **only** inside `setting` (e.g. `"filament_id":"P1ec9c9c"`)
+// and does **not** duplicate it as a top-level key. Sending a top-level
+// `filament_id` without the same field inside `setting` yields HTTP 200
+// but the server stores `filament_id: null` in GET /setting/<id> and
+// printer-side catalogue sync never picks up the material ID.
+//
+// Also match stock for: `"public":false` on create; omit empty top-level
+// `base_id` (never send ""); PATCH print presets lead with `base_id`
+// when non-empty.
 std::string build_upload_body(const std::string& name,
-                              const std::map<std::string, std::string>& values_map)
+                              const std::map<std::string, std::string>& values_map,
+                              bool is_create)
 {
-    // Keys lifted to the envelope rather than dumped into `setting`.
-    // Studio's values_map also contains them, but the server stores
-    // them as first-class metadata; leaving them inside `setting`
-    // works too but deviates from Studio's shape.
     static const char* const top_keys[] = {
-        IOT_JSON_KEY_VERSION, IOT_JSON_KEY_TYPE,
-        IOT_JSON_KEY_BASE_ID, IOT_JSON_KEY_FILAMENT_ID,
+        IOT_JSON_KEY_VERSION, IOT_JSON_KEY_TYPE, IOT_JSON_KEY_BASE_ID,
     };
     auto is_top = [&](const std::string& k) {
         for (auto* tk : top_keys) if (k == tk) return true;
@@ -136,16 +142,20 @@ std::string build_upload_body(const std::string& name,
         return it == values_map.end() ? std::string{} : it->second;
     };
 
+    const std::string bid    = get_or(IOT_JSON_KEY_BASE_ID);
+    const std::string typ    = get_or(IOT_JSON_KEY_TYPE);
+    const std::string ver    = get_or(IOT_JSON_KEY_VERSION);
+
     std::ostringstream os;
     os << '{';
-    os << "\"name\":"    << obn::json::escape(name);
-    os << ",\"version\":" << obn::json::escape(get_or(IOT_JSON_KEY_VERSION));
-    os << ",\"type\":"    << obn::json::escape(get_or(IOT_JSON_KEY_TYPE));
-    os << ",\"base_id\":" << obn::json::escape(get_or(IOT_JSON_KEY_BASE_ID));
-    // filament_id only exists for filament presets; send empty string
-    // otherwise so the server's validator doesn't choke on missing
-    // fields.
-    os << ",\"filament_id\":" << obn::json::escape(get_or(IOT_JSON_KEY_FILAMENT_ID));
+
+    if (!is_create && !bid.empty()) {
+        os << "\"base_id\":" << obn::json::escape(bid) << ',';
+    }
+    os << "\"name\":" << obn::json::escape(name);
+    if (is_create) {
+        os << ",\"public\":false";
+    }
 
     os << ",\"setting\":{";
     bool first = true;
@@ -154,11 +164,35 @@ std::string build_upload_body(const std::string& name,
         // "code" is an error-reporting slot we write back in-place; it
         // must not be uploaded as part of the preset.
         if (k == "code") continue;
+        // Envelope-only / session metadata Studio sometimes leaves in the map.
+        if (k == IOT_JSON_KEY_NAME || k == IOT_JSON_KEY_SETTING_ID ||
+            k == IOT_JSON_KEY_USER_ID || k == "public") {
+            continue;
+        }
         if (!first) os << ',';
         first = false;
         os << obn::json::escape(k) << ':' << obn::json::escape(v);
     }
-    os << "}}";
+    os << '}';
+
+    if (is_create) {
+        // Stock POST always includes these keys; keep them even when empty
+        // so we do not regress servers that validate presence, not just MITM
+        // shapes with non-empty bundles.
+        os << ",\"type\":" << obn::json::escape(typ);
+        os << ",\"version\":" << obn::json::escape(ver);
+    } else {
+        if (!typ.empty()) {
+            os << ",\"type\":" << obn::json::escape(typ);
+        }
+        if (!ver.empty()) {
+            os << ",\"version\":" << obn::json::escape(ver);
+        }
+    }
+    if (is_create && !bid.empty()) {
+        os << ",\"base_id\":" << obn::json::escape(bid);
+    }
+    os << '}';
     return os.str();
 }
 
@@ -322,7 +356,7 @@ std::string create(Agent*                              a,
         return {};
     }
 
-    std::string body = build_upload_body(name, values_map);
+    std::string body = build_upload_body(name, values_map, /*is_create=*/true);
     auto resp = obn::http::post_json(settings_base(a), body, hdrs);
     if (http_code) *http_code = static_cast<unsigned int>(resp.status_code);
     OBN_INFO("cloud_presets::create name='%s' http=%ld bytes=%zu",
@@ -358,7 +392,7 @@ int update(Agent*                              a,
         return BAMBU_NETWORK_ERR_PUT_SETTING_FAILED;
     }
 
-    std::string body = build_upload_body(name, values_map);
+    std::string body = build_upload_body(name, values_map, /*is_create=*/false);
     obn::http::Request req;
     req.method  = obn::http::Method::PATCH;
     req.url     = settings_base(a) + "/" + obn::http::url_encode(setting_id);
