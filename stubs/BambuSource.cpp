@@ -1079,7 +1079,7 @@ std::string ensure_ftp(Tunnel* t)
     cfg.password = t->url.passwd;
     log_fmt(t->logger, t->log_ctx,
             "ctrl: FTPS connect host=%s user=%s", cfg.host.c_str(), cfg.username.c_str());
-    std::string err = t->ftp->connect(cfg);
+    std::string err = obn::ftps::connect_with_fallback(*t->ftp, cfg);
     if (!err.empty()) {
         log_fmt(t->logger, t->log_ctx,
                 "ctrl: FTPS connect failed: %s", err.c_str());

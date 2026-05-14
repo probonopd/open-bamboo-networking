@@ -1,8 +1,8 @@
 #pragma once
 
-// Implicit-TLS FTPS client for Bambu printers.
+// FTP/FTPS client for Bambu printers.
 //
-// Bambu printers speak a quirky flavour of FTPS:
+// Bambu printers typically speak a quirky flavour of FTPS:
 //   * Implicit TLS on port 990 (the TLS handshake starts immediately after
 //     TCP connect; there is no AUTH TLS command).
 //   * Self-signed server certificate. We verify against the bundled
@@ -13,6 +13,13 @@
 //   * The data channel also runs TLS (PROT P), and some firmwares expect
 //     the data socket to reuse the control socket's TLS session, which we
 //     opt into via SSL_SESSION_dup when available.
+//
+// At least one P1S unit was reported to have TLS ports (8883/990) closed
+// while plain-text equivalents (1883/21) remained accessible. The root cause
+// is unknown -- possibly a firmware variant or configuration issue. Set
+// use_tls=false in ConnectConfig to speak plain FTP, or use
+// connect_with_fallback() which tries TLS first and falls back to plain on
+// any failure.
 //
 // Only the operations needed by print and probe paths are implemented:
 // connect/login, STOR (upload), DELE, SIZE, LIST, QUIT.
@@ -30,6 +37,11 @@ struct ConnectConfig {
     int         port       = 990;
     std::string username   = "bblp";
     std::string password;
+
+    // When true (default), use implicit TLS on the control and data
+    // channels (FTPS, port 990). When false, connect without TLS
+    // (plain FTP, typically port 21); ca_file is ignored.
+    bool        use_tls    = true;
 
     // Path to a CA bundle (PEM). If empty, TLS verification is disabled
     // (matching the behaviour we already use for MQTT against printers
@@ -122,5 +134,11 @@ public:
 private:
     std::unique_ptr<Impl> p_;
 };
+
+// Tries to connect with TLS (port 990) first. If use_tls is already false
+// in cfg, connects plain immediately (port 21 unless cfg.port was overridden).
+// On any TLS failure retries with use_tls=false and port=21.
+// Returns empty string on success; error description on failure.
+std::string connect_with_fallback(Client& client, ConnectConfig cfg);
 
 } // namespace obn::ftps
