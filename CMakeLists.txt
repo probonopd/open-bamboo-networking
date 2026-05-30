@@ -692,13 +692,9 @@ if(OBN_BUILD_TESTS AND NOT WIN32)
         src/auth.cpp
         src/cert_store.cpp
         src/config.cpp
-        src/cloud_auth.cpp
-        src/cloud_presets.cpp
-        src/cloud_session.cpp
         src/cover_cache.cpp
         src/cover_server.cpp
         src/ftps.cpp
-        src/http_client.cpp
         src/json_lite.cpp
         src/lan_session.cpp
         src/lan_tls.cpp
@@ -710,17 +706,29 @@ if(OBN_BUILD_TESTS AND NOT WIN32)
         src/tls_dial.cpp
         src/tunnel_local.cpp
         src/tunnel_upload.cpp)
+    if(NOT OBN_LAN_ONLY)
+        target_sources(lan_live_test PRIVATE
+            src/cloud_auth.cpp
+            src/cloud_presets.cpp
+            src/cloud_session.cpp
+            src/http_client.cpp)
+    endif()
     target_include_directories(lan_live_test PRIVATE include)
     target_compile_definitions(lan_live_test PRIVATE
         OBN_VERSION_STRING="${OBN_VERSION}"
         ABI_VERSION=${OBN_ABI_VERSION_HEX}
     )
+    if(OBN_LAN_ONLY)
+        target_compile_definitions(lan_live_test PRIVATE OBN_LAN_ONLY=1)
+    endif()
     target_link_libraries(lan_live_test PRIVATE
         obn_mosquitto_iface
-        obn_curl_iface
         OpenSSL::SSL
         OpenSSL::Crypto
         ZLIB::ZLIB
     )
+    if(NOT OBN_LAN_ONLY)
+        target_link_libraries(lan_live_test PRIVATE obn_curl_iface)
+    endif()
     add_test(NAME lan_live COMMAND lan_live_test)
 endif()

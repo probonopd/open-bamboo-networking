@@ -279,3 +279,41 @@ jobs:
           name: obn-macos-v${{ matrix.abi }}.xx
           path: dist/
           if-no-files-found: error
+
+  build-lan-only:
+    name: LAN_ONLY build test (linux-x64)
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake pkg-config ca-certificates git \
+            libcjson-dev uthash-dev libssl-dev zlib1g-dev
+
+      - name: Configure with --lan-only
+        run: |
+          ./configure \
+            --build-type=Release \
+            --enable-tests \
+            --lan-only \
+            --no-conf-patch
+
+      - name: Build
+        run: make -j"$(nproc)"
+
+      - name: Run tests
+        run: make test
+
+      - name: Verify no cloud code was compiled
+        run: |
+          set -eu
+          # Check that cloud headers were not included in compilation
+          # by verifying the binary doesn't reference cloud symbols
+          nm build/libbambu_networking.so | grep -q "CloudSession" && \
+            { echo "ERROR: CloudSession symbol found in LAN_ONLY build"; exit 1; } || true
+          echo "✓ No CloudSession symbols in LAN_ONLY build"

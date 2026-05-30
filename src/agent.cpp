@@ -711,7 +711,9 @@ void Agent::set_config_dir(std::string dir)
         obn::lan_tls::registry_set_config_dir(cfg);
         auth_store_ = std::make_unique<obn::auth::Store>(cfg + "/obn.auth.json");
         auth_store_->load();
+#ifndef OBN_LAN_ONLY
         hydrate_session();
+#endif
     }
 }
 
