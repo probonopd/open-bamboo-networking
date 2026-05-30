@@ -49,15 +49,19 @@ void apply_key(Settings& out, const std::string& key, const std::string& val)
     else if (key == "log_stderr")     out.log_stderr = val;
     else if (key == "log_to_file")    out.log_to_file = val;
     else if (key == "log_file")       out.log_file = val;
+#ifndef OBN_LAN_ONLY
     else if (key == "cloud_api_host") out.cloud_api_host = val;
     else if (key == "cloud_web_host") out.cloud_web_host = val;
     else if (key == "cloud_mqtt_host") out.cloud_mqtt_host = val;
+#endif
     else if (key == "lan_tls_skip_verify")      out.lan_tls_skip_verify = truthy(val);
+#ifndef OBN_LAN_ONLY
     else if (key == "cloud_mqtt_port") {
         int p = std::atoi(val.c_str());
         if (p > 0 && p <= 65535) out.cloud_mqtt_port = p;
     }
     else if (key == "block_cloud")              out.block_cloud = truthy(val);
+#endif
     else if (key == "force_timelapse_external")  out.force_timelapse_external = truthy(val);
     else if (key == "bambusource_log_level")     out.bambusource_log_level = val;
     else if (key == "bambusource_log_file")      out.bambusource_log_file = val;
@@ -95,14 +99,18 @@ bool write_default_template(const std::filesystem::path& path)
       << "log_to_file = 0\n"
       << "# log_file = /absolute/path/to/obn.log\n"
       << "\n"
+#ifndef OBN_LAN_ONLY
       << "# --- Cloud endpoints ---\n"
       << "# Leave empty for production US/CN by country_code.\n"
       << "# Production global: https://api.bambulab.com / https://bambulab.com / us.mqtt.bambulab.com\n"
       << "# Production CN:      https://api.bambulab.cn / https://bambulab.cn / cn.mqtt.bambulab.com\n"
       << "# Dev/QA (Studio):    https://api-dev.bambulab.net / https://api-qa.bambulab.net / ...\n"
+#endif
+#ifndef OBN_LAN_ONLY
       << "# cloud_api_host = https://api.bambulab.com\n"
       << "# cloud_web_host = https://bambulab.com\n"
       << "# cloud_mqtt_host = us.mqtt.bambulab.com\n"
+#endif
       << "\n"
       << "# Cloud MQTT port (default 8883).\n"
       << "# cloud_mqtt_port = 8883\n"

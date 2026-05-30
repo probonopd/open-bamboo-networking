@@ -6,9 +6,13 @@
 #include "obn/abi_export.hpp"
 #include "obn/agent.hpp"
 #include "obn/bambu_networking.hpp"
+#ifndef OBN_LAN_ONLY
 #include "obn/cloud_auth.hpp"
+#endif
 #include "obn/config.hpp"
+#ifndef OBN_LAN_ONLY
 #include "obn/http_client.hpp"
+#endif
 #include "obn/json_lite.hpp"
 #include "obn/log.hpp"
 
@@ -47,6 +51,7 @@ OBN_ABI int bambu_network_check_user_task_report(void* /*agent*/, int* task_id, 
     return BAMBU_NETWORK_SUCCESS;
 }
 
+#ifndef OBN_LAN_ONLY
 namespace {
 
 // Serialize a json_lite value back to compact JSON text. We only need
@@ -122,13 +127,17 @@ std::string remap_bind_payload(const std::string& raw_body,
 }
 
 } // namespace
+#endif // OBN_LAN_ONLY
 
 OBN_ABI int bambu_network_get_user_print_info(void* agent,
                                               unsigned int* http_code, std::string* http_body)
 {
     if (http_code) *http_code = 0;
     if (http_body) http_body->clear();
-
+#ifdef OBN_LAN_ONLY
+    (void)agent;
+    return BAMBU_NETWORK_ERR_GET_USER_PRINTINFO_FAILED;
+#else
     auto* a = as_agent(agent);
     if (!a) return BAMBU_NETWORK_ERR_GET_USER_PRINTINFO_FAILED;
     auto s = a->user_session_snapshot();
@@ -163,21 +172,13 @@ OBN_ABI int bambu_network_get_user_print_info(void* agent,
     OBN_INFO("get_user_print_info: mapped %zu -> %zu bytes, %zu device(s)",
              resp.body.size(), mapped.size(), dev_ids.size());
 
-    // Studio's DeviceManager never calls add_subscribe() for single-
-    // machine cloud mode (the only call sites in GUI_App.cpp / DevManager
-    // are either commented out or gated on the multi-machine flag), yet
-    // the stock Bambu plugin still receives per-device pushes from the
-    // cloud. We replicate that behaviour here: every device the /user/
-    // bind endpoint returns becomes an implicit subscription to
-    // device/<id>/report. Cloud MQTT connect may not have landed yet -
-    // CloudSession buffers the desired set and re-applies it on the
-    // next CONNACK, so ordering doesn't matter.
     if (!dev_ids.empty() && !obn::config::current().block_cloud) {
         a->cloud_add_subscribe(dev_ids);
     }
 
     if (http_body) *http_body = std::move(mapped);
     return BAMBU_NETWORK_SUCCESS;
+#endif
 }
 
 OBN_ABI int bambu_network_get_user_tasks(void* /*agent*/,
