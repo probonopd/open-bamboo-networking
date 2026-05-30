@@ -172,6 +172,15 @@ OBN_ABI int bambu_network_get_user_print_info(void* agent,
     OBN_INFO("get_user_print_info: mapped %zu -> %zu bytes, %zu device(s)",
              resp.body.size(), mapped.size(), dev_ids.size());
 
+    // Studio's DeviceManager never calls add_subscribe() for single-
+    // machine cloud mode (the only call sites in GUI_App.cpp / DevManager
+    // are either commented out or gated on the multi-machine flag), yet
+    // the stock Bambu plugin still receives per-device pushes from the
+    // cloud. We replicate that behaviour here: every device the /user/
+    // bind endpoint returns becomes an implicit subscription to
+    // device/<id>/report. Cloud MQTT connect may not have landed yet -
+    // CloudSession buffers the desired set and re-applies it on the
+    // next CONNACK, so ordering doesn't matter.
     if (!dev_ids.empty() && !obn::config::current().block_cloud) {
         a->cloud_add_subscribe(dev_ids);
     }
