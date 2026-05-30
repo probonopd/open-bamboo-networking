@@ -126,14 +126,14 @@ jobs:
       - name: Run tests
         run: make test
 
+      - name: Install
+        run: cmake --install build --prefix "$GITHUB_WORKSPACE/install"
+
       - name: Stage artifacts
         run: |
           set -eu
-          VER='${{ needs.get-version.outputs.network_version }}'
           mkdir -p dist
-          cp "build/libbambu_networking_${VER}.so" dist/
-          cp build/libBambuSource.so               dist/
-          cp build/liblive555.so                   dist/
+          cp install/plugins/*  dist/
           ls -l dist/
 
       - name: Upload artifacts
@@ -190,14 +190,14 @@ jobs:
       - name: Run tests
         run: make test
 
+      - name: Install
+        run: cmake --install build --prefix "$GITHUB_WORKSPACE/install"
+
       - name: Stage artifacts
         run: |
           set -eu
-          VER='${{ needs.get-version.outputs.network_version }}'
           mkdir -p dist
-          cp "build/libbambu_networking_${VER}.dylib" dist/
-          cp build/libBambuSource.dylib               dist/
-          cp build/liblive555.dylib                   dist/
+          cp install/plugins/*  dist/
           ls -l dist/
 
       - name: Upload artifacts
