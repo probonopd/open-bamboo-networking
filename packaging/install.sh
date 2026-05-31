@@ -138,13 +138,11 @@ if [ -z "$MATCHED_DIR" ]; then
     done
 fi
 
-if [ -z "$MATCHED_DIR" ]; then
-    # Last resort: pick the highest available
-    MATCHED_DIR=$(ls -d "$LIB_DIR"/v*/ 2>/dev/null | sort -V | tail -1)
-fi
-
 if [ -z "$MATCHED_DIR" ] || [ ! -d "$MATCHED_DIR" ]; then
-    die "No matching ABI version found in $LIB_DIR"
+    AVAILABLE=$(ls -d "$LIB_DIR"/v*/ 2>/dev/null | xargs -I{} basename {} | sed 's/^v//' | tr '\n' ' ')
+    die "No compatible ABI version for $CLIENT_LABEL v${DETECTED_VER} (need ${ABI_PREFIX}).
+  Available in this package: ${AVAILABLE:-none}
+  You may need a newer distribution package from GitHub."
 fi
 
 MATCHED_VER=$(basename "$MATCHED_DIR" | sed 's/^v//')
@@ -157,7 +155,7 @@ DEST_DIR="$PREFIX/plugins"
 printf "${BOLD}Installation summary:${RESET}\n"
 printf "  Slicer:       %s\n" "$CLIENT_LABEL"
 printf "  Config dir:   %s\n" "$PREFIX"
-printf "  ABI version:  %s (detected %s)\n" "$MATCHED_VER" "$DETECTED_VER"
+printf "  ABI version:  %s (detected %s v%s)\n" "$MATCHED_VER" "$CLIENT_LABEL" "$DETECTED_VER"
 printf "  Install to:   %s\n" "$DEST_DIR"
 echo ""
 prompt_yn "Proceed?" || { echo "Aborted."; exit 0; }

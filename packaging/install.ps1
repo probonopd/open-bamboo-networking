@@ -142,13 +142,14 @@ if (-not $MatchedDir) {
     }
 }
 
-if (-not $MatchedDir) {
-    $dirs = Get-ChildItem -Path $LibDir -Directory -Filter "v*" | Sort-Object Name
-    if ($dirs.Count -gt 0) { $MatchedDir = $dirs[-1].FullName }
-}
-
 if (-not $MatchedDir -or -not (Test-Path $MatchedDir)) {
-    Write-Err "No matching ABI version found in $LibDir"
+    $available = (Get-ChildItem -Path $LibDir -Directory -Filter "v*" |
+                  Sort-Object Name |
+                  ForEach-Object { $_.Name -replace '^v', '' }) -join ', '
+    if (-not $available) { $available = "none" }
+    Write-Err "No compatible ABI version for $ClientLabel v$detected (need $AbiPrefix)."
+    Write-Err "Available in this package: $available"
+    Write-Err "You may need a newer distribution package from GitHub."
     exit 1
 }
 
@@ -162,7 +163,7 @@ $DestDir = Join-Path $Prefix "plugins"
 Write-Host "Installation summary:" -ForegroundColor White
 Write-Host "  Slicer:       $ClientLabel"
 Write-Host "  Config dir:   $Prefix"
-Write-Host "  ABI version:  $MatchedVer (detected $detected)"
+Write-Host "  ABI version:  $MatchedVer (detected $ClientLabel v$detected)"
 Write-Host "  Install to:   $DestDir"
 Write-Host ""
 $confirm = Read-Host "Proceed? [Y/n]"
