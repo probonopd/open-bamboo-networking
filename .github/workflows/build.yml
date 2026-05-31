@@ -301,6 +301,7 @@ jobs:
             --build-type=Release \
             --enable-tests \
             --lan-only \
+            --with-version='02.06.01.99' \
             --no-conf-patch
 
       - name: Build
